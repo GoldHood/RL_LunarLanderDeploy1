@@ -1,4 +1,5 @@
 # app_rest.py  — REST + MJPEG + humano + marcador final estilo Atari
+# Hello
 import os, io, time, threading, logging
 from typing import Optional, Dict
 

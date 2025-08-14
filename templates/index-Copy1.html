@@ -1,0 +1,80 @@
+<!-- templates/index.html -->
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>LunarLander — REST + MJPEG</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:system-ui,sans-serif;background:#0b1020;color:#e8ecff;margin:0;padding:24px}
+    .wrap{max-width:920px}
+    .controles{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+    button{border:0;padding:10px 14px;border-radius:10px;background:#2f47e0;color:#fff;font-weight:600;cursor:pointer}
+    #estado{background:#121a34;border:1px solid #24306a;padding:10px 14px;border-radius:10px;margin:12px 0}
+    img{width:100%;max-width:880px;background:#000;border:1px solid #24306a;border-radius:10px}
+    .nota{opacity:.85}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>👾 LunarLander — visor REST</h1>
+    <div class="controles">
+      <button id="btn-demo">Demo</button>
+      <button data-modelo="modelo_1">Modelo 1</button>
+      <button data-modelo="modelo_2">Modelo 2</button>
+      <button data-modelo="modelo_3">Modelo 3</button>
+      <button data-modelo="modelo_4">Modelo 4</button>
+      <button id="btn-stop" style="background:#d13438">Stop</button>
+    </div>
+
+    <div id="estado">Listo. Pulsa Demo o un modelo.</div>
+
+    <!-- El stream MJPEG es simplemente un <img> apuntando a /stream -->
+    <img id="stream" src="/stream" alt="Stream del juego">
+
+    <div class="nota">Modelos esperados: <code>{{ esperados | join(", ") }}</code> (se usan si existe <i>.zip</i>).</div>
+  </div>
+
+  <script>
+    const estadoDiv = document.getElementById('estado');
+    const setEstado = (t) => estadoDiv.textContent = t;
+
+    async function llamar(method, url, body) {
+      const res = await fetch(url, {
+        method, headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : null
+      });
+      return res.json().catch(() => ({}));
+    }
+
+    document.getElementById('btn-demo').onclick = async () => {
+      const r = await llamar('POST', '/demo');
+      setEstado(r.ok ? 'Demo iniciada…' : (r.msg || 'Error'));
+    };
+
+    document.getElementById('btn-stop').onclick = async () => {
+      const r = await llamar('POST', '/stop');
+      setEstado('Stop solicitado.');
+    };
+
+    [...document.querySelectorAll('button[data-modelo]')].forEach(btn => {
+      btn.onclick = async () => {
+        const id = btn.dataset.modelo;
+        const r = await llamar('POST', '/modelo', { modelo_id: id });
+        setEstado(r.ok ? `Iniciando ${id}…` : (r.msg || 'Error'));
+      };
+    });
+
+    // Polling suave de estado para mostrar recompensa/pasos
+    setInterval(async () => {
+      const e = await fetch('/estado').then(r => r.json()).catch(() => null);
+      if (e) {
+        const linea = e.en_ejecucion
+          ? `En ejecución (${e.modo}${e.modelo_id ? ' / '+e.modelo_id : ''}) — pasos: ${e.pasos} — recompensa: ${(+e.recompensa).toFixed(2)}`
+          : 'Inactivo. Pulsa Demo o un modelo.';
+        setEstado(linea);
+      }
+    }, 1000);
+  </script>
+</body>
+</html>

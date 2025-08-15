@@ -1,4 +1,5 @@
-# app_rest.py  — REST + MJPEG + control humano por teclado (W/A/D o flechas)
+# app_rest.py  — REST + MJPEG + humano + marcador final estilo Atari
+# Hello
 import os, io, time, threading, logging
 from typing import Optional, Dict
 
@@ -13,7 +14,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 MODELOS_ESPERADOS = ["modelo_1", "modelo_2", "modelo_3", "modelo_4"]
 
 # ===== Estado del episodio (con lock) =====
-estado: Dict = {"en_ejecucion": False, "modo": None, "modelo_id": None, "recompensa": 0.0, "pasos": 0}
+estado: Dict = {
+    "en_ejecucion": False,
+    "modo": None,
+    "modelo_id": None,
+    "recompensa": 0.0,
+    "pasos": 0,
+    "ultimo_puntaje": None,   # <<--- NUEVO: se conserva tras terminar
+}
 estado_lock = threading.Lock()
 
 # ===== Control de hilo/stop =====
@@ -42,13 +50,12 @@ def _to_jpeg(frame_rgb: np.ndarray, calidad: int = 80) -> bytes:
 
 def _politica_demo(obs: np.ndarray) -> int:
     x, y, vx, vy, theta, vtheta, lc, rc = obs
-    if vy < -0.4: return 2          # motor principal
-    if theta > 0.1: return 1        # corrige a izq
-    if theta < -0.1: return 3       # corrige a der
-    return 0                        # no-op
+    if vy < -0.4: return 2
+    if theta > 0.1: return 1
+    if theta < -0.1: return 3
+    return 0
 
 def _accion_desde_teclas(keys: Dict[str, bool]) -> int:
-    # Prioridad: up > left > right > noop
     if keys.get("up"): return 2
     if keys.get("left"): return 1
     if keys.get("right"): return 3
@@ -60,7 +67,7 @@ def _cargar_modelo(nombre: str):
     ruta = f"{nombre}.zip"
     if not os.path.exists(ruta):
         return None
-    from stable_baselines3 import DQN  # ajusta si tus modelos son PPO/A2C/…
+    from stable_baselines3 import DQN  # ajusta aquí si tus modelos usan otro algoritmo
     modelo = DQN.load(ruta)
     _modelos_cache[nombre] = modelo
     logging.info(f"✅ Cargado {ruta}")
@@ -71,6 +78,7 @@ def _actualizar_estado(**kwargs):
         estado.update(kwargs)
 
 def _reset_estado():
+    # NO borramos 'ultimo_puntaje' para mostrarlo al terminar
     _actualizar_estado(en_ejecucion=False, modo=None, modelo_id=None, recompensa=0.0, pasos=0)
 
 # ---------- Bucle de simulación ----------
@@ -89,10 +97,8 @@ def _simular(modo: str, modelo_id: Optional[str] = None, seed: Optional[int] = N
                 logging.warning("Modelo no disponible; se aborta simulación.")
                 return
 
-        # Estado inicial
         _actualizar_estado(en_ejecucion=True, modo=modo, modelo_id=modelo_id, recompensa=0.0, pasos=0)
 
-        # Primer frame
         frame = env.render()
         with frame_lock:
             ultimo_jpeg = _to_jpeg(frame)
@@ -126,6 +132,9 @@ def _simular(modo: str, modelo_id: Optional[str] = None, seed: Optional[int] = N
     finally:
         if env is not None:
             env.close()
+        # Guarda el puntaje final ANTES de resetear
+        with estado_lock:
+            estado["ultimo_puntaje"] = estado["recompensa"]
         stop_event.clear()
         with control_lock:
             control["enabled"] = False
@@ -159,7 +168,6 @@ def get_estado():
 def stream():
     return Response(_generador_mjpeg(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-# --- Episodios demo/modelo ---
 @app.post("/demo")
 def post_demo():
     global hilo_simulacion
@@ -227,9 +235,8 @@ def humano_stop():
     stop_event.set()
     return jsonify({"ok": True})
 
-# ---------- Main ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5055))
-    logging.info(f"Sirviendo en http://127.0.0.1:{port} (REST + MJPEG + humano)")
+    logging.info(f"Sirviendo en http://127.0.0.1:{port} (REST + MJPEG + humano + marcador)")
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
 

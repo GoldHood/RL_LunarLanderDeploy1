@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  lunarlander:
+    build: .
+    container_name: lunarlander
+    ports:
+      - "80:8000"           # expone en http://<IP>
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      MODELS_DIR: "/app/models"
+      AUTO_PULL_S3: "1"     # 1=auto-descarga si faltan
+      S3_BUCKET: "tu-bucket"    # <-- pon tu bucket o quítalo si no usarás S3
+      S3_PREFIX: "lunarlander/" # opcional (prefijo en el bucket)
+      # Si NO usas IAM Role, podrías inyectar credenciales (mejor evitarlo)
+      # AWS_ACCESS_KEY_ID: "AKIA..."
+      # AWS_SECRET_ACCESS_KEY: "..."
+      # AWS_DEFAULT_REGION: "us-east-1"
+    volumes:
+      - ./models:/app/models:rw    # para guardar localmente lo que baje de S3 (y persistir)
+    restart: unless-stopped

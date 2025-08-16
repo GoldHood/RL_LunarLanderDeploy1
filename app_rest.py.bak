@@ -1,0 +1,392 @@
+import os, io, time, threading, logging, json, os.path as op
+from typing import Optional, Dict, Any, Sequence
+import numpy as np
+from PIL import Image
+from flask import Flask, render_template, request, jsonify, Response
+import gymnasium as gym
+
+# --------------------------- Config & globals ---------------------------
+app = Flask(__name__, template_folder="templates")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+MODELOS_DIR   = os.environ.get("MODELS_DIR", "/app/models")
+S3_BUCKET     = (os.environ.get("S3_BUCKET") or "").strip() or None
+S3_PREFIX     = os.environ.get("S3_PREFIX", "").strip()
+AUTO_PULL_S3  = os.environ.get("AUTO_PULL_S3", "1") not in ("0","false","False")
+
+DEFAULT_MAP = {"Qlearning1k":"trained_agent_Qlearning1k.pkl",
+               "Qlearning19k":"trained_agent_Qlearning19k.pkl",
+               "Sarsa19k":"trained_agent_sarsa19k.pkl"}
+try:
+    env_map = json.loads(os.environ.get("MODELOS_MAP_JSON","") or "{}")
+    assert isinstance(env_map, dict)
+except Exception:
+    env_map = {}
+MODELOS_MAP = {**DEFAULT_MAP, **env_map}
+MODELOS_ESPERADOS = list(MODELOS_MAP.keys())
+
+os.makedirs(MODELOS_DIR, exist_ok=True)
+
+estado: Dict = {"en_ejecucion": False, "modo": None, "modelo_id": None,
+                "recompensa": 0.0, "pasos": 0, "ultimo_puntaje": None}
+estado_lock = threading.Lock()
+hilo_simulacion: Optional[threading.Thread] = None
+stop_event = threading.Event()
+
+ultimo_jpeg: Optional[bytes] = None
+frame_lock = threading.Lock()
+_modelos_cache = {}
+control = {"enabled": False, "keys": {"up": False, "left": False, "right": False}}
+control_lock = threading.Lock()
+
+# --------------------------- Utilidades ---------------------------
+def _to_jpeg(frame_rgb: np.ndarray, calidad: int = 80) -> bytes:
+    if frame_rgb.dtype != np.uint8:
+        frame_rgb = np.clip(frame_rgb, 0, 255).astype(np.uint8)
+    im = Image.fromarray(frame_rgb)
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=calidad)
+    return buf.getvalue()
+
+def _politica_demo(obs: np.ndarray) -> int:
+    x,y,vx,vy,theta,vtheta,lc,rc = obs
+    if vy < -0.4: return 2
+    if theta >  0.1: return 1
+    if theta < -0.1: return 3
+    return 0
+
+def _accion_desde_teclas(keys: Dict[str, bool]) -> int:
+    if keys.get("up"):    return 2
+    if keys.get("left"):  return 1
+    if keys.get("right"): return 3
+    return 0
+
+# --------------------------- Descarga S3 ---------------------------
+def _s3_try_download_by_key(s3_key: str) -> Optional[str]:
+    if not (S3_BUCKET and AUTO_PULL_S3 and s3_key):
+        return None
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        dest = op.join(MODELOS_DIR, op.basename(s3_key))
+        os.makedirs(MODELOS_DIR, exist_ok=True)
+        logging.info(f"S3 get s3://{S3_BUCKET}/{S3_PREFIX}{s3_key} -> {dest}")
+        s3.download_file(S3_BUCKET, f"{S3_PREFIX}{s3_key}", dest)
+        return dest
+    except Exception as e:
+        logging.warning(f"No se pudo descargar {s3_key} desde S3: {e}")
+        return None
+
+def _s3_try_download_guess(modelo_id: str) -> Optional[str]:
+    for ext in (".zip",".pkl"):
+        key = f"{modelo_id}{ext}"
+        p = _s3_try_download_by_key(key)
+        if p: return p
+    return None
+
+# --------------------------- Wrappers de modelo ---------------------------
+class _SB3Wrapper:
+    def __init__(self, algo): self.algo = algo
+    def predict(self, obs): a,_ = self.algo.predict(obs, deterministic=True); return int(a)
+
+def _as_array(values: Any) -> np.ndarray:
+    if isinstance(values, dict):
+        # dict {accion:valor}
+        arr = np.full(4, -1e9, dtype=float)
+        for a, v in values.items():
+            try: arr[int(a)] = float(v)
+            except Exception: pass
+        return arr
+    try:
+        arr = np.asarray(values, dtype=float).reshape(-1)
+        if arr.size < 4:
+            out = np.full(4, -1e9, dtype=float)
+            out[:arr.size] = arr
+            return out
+        return arr[:4]
+    except Exception:
+        return np.full(4, -1e9, dtype=float)
+
+def _default_bin_edges() -> Sequence[np.ndarray]:
+    # 8 obs: x, y, vx, vy, theta, vtheta, left_contact, right_contact
+    # edges para np.digitize (N-1 edges => N bins)
+    def edges(lo, hi, N=8): return np.linspace(lo, hi, N+1)[1:-1]
+    return [
+        edges(-1.5,  1.5, 8),  # x
+        edges(-0.5,  1.5, 8),  # y
+        edges(-2.0,  2.0, 8),  # vx
+        edges(-2.0,  2.0, 8),  # vy
+        edges(-3.1,  3.1, 8),  # theta
+        edges(-5.0,  5.0, 8),  # vtheta
+        np.array([0.5]),       # left_contact
+        np.array([0.5])        # right_contact
+    ]
+
+class _TabularQLWrapper:
+    """
+    Adapta Q-table/SARSA pickled:
+      - qtable como dict: { (s0,...,s7): [q0,q1,q2,q3] } o { (s): {a:Q} }
+      - también acepta tuples (qtable, bins) o dict {"q_table":..., "bins":...}
+      - si no hay 'bins', usa _default_bin_edges()
+    """
+    def __init__(self, qtable: Any, bins: Optional[Sequence[np.ndarray]] = None):
+        self.q = qtable
+        self.bins = self._normalize_bins(bins) if bins is not None else _default_bin_edges()
+        logging.info(f"Q-table cargada (tipo: {type(self.q).__name__}); usando bins: "
+                     f"{[len(b) for b in self.bins]}")
+
+    @staticmethod
+    def _normalize_bins(bins: Any) -> Sequence[np.ndarray]:
+        try:
+            L = list(bins)
+            out = []
+            for i, b in enumerate(L):
+                arr = np.asarray(b, dtype=float).ravel()
+                if arr.size == 0:  # para contactos usa umbral 0.5
+                    arr = np.array([0.5])
+                out.append(arr)
+            if len(out) < 8:
+                # completar
+                out += list(_default_bin_edges())[len(out):]
+            return out[:8]
+        except Exception:
+            return _default_bin_edges()
+
+    def _discretize(self, obs: np.ndarray) -> tuple:
+        # np.digitize devuelve indices 0..len(edges)
+        idx = []
+        for i, edges in enumerate(self.bins):
+            if i in (6,7):  # contactos
+                idx.append( int(obs[i] > 0.5) )
+            else:
+                idx.append( int(np.digitize(obs[i], edges)) )
+        return tuple(idx)
+
+    def _get_qvalues(self, s: tuple) -> np.ndarray:
+        v = None
+        if isinstance(self.q, dict):
+            v = self.q.get(s)
+            if v is None:
+                # algunos guardan str(tuple) como clave
+                v = self.q.get(str(s))
+        elif hasattr(self.q, "get"):
+            v = self.q.get(s)  # defaultdict etc.
+        return _as_array(v) if v is not None else np.full(4, -1e9, dtype=float)
+
+    def predict(self, obs: np.ndarray) -> int:
+        s = self._discretize(obs)
+        q = self._get_qvalues(s)
+        a = int(np.argmax(q))
+        return a
+
+class _CustomWrapper:
+    """ Envuelve objetos que ya traen predict/act. """
+    def __init__(self, obj): self.obj = obj
+    def predict(self, obs):
+        if hasattr(self.obj,"predict"): return int(self.obj.predict(obs))
+        if hasattr(self.obj,"act"):     return int(self.obj.act(obs))
+        # intentar auto-adaptar si es Q-table simple
+        # formatos comunes: {"q_table":..., "bins":...} o {"Q":...} o tuple (Q, bins)
+        qtable, bins = None, None
+        if isinstance(self.obj, dict):
+            for k in ("q_table","Q","q","table"):
+                if k in self.obj: qtable = self.obj[k]; break
+            for k in ("bins","bin_edges","obs_bins"):
+                if k in self.obj: bins = self.obj[k]; break
+        elif isinstance(self.obj, (list, tuple)) and len(self.obj)>=1:
+            qtable = self.obj[0]
+            if len(self.obj)>=2: bins = self.obj[1]
+        if qtable is not None:
+            logging.info("Auto-adaptando .pkl tabular a _TabularQLWrapper")
+            self.obj = _TabularQLWrapper(qtable, bins)
+            return int(self.obj.predict(obs))
+        raise RuntimeError("El objeto .pkl no expone predict(obs) ni act(obs).")
+
+# --------------------------- Carga de modelo ---------------------------
+def _cargar_modelo(modelo_id: str):
+    if modelo_id in _modelos_cache: return _modelos_cache[modelo_id]
+    s3_key = MODELOS_MAP.get(modelo_id)
+    ruta = None
+    if s3_key:
+        cand = op.join(MODELOS_DIR, op.basename(s3_key))
+        ruta = cand if op.exists(cand) else _s3_try_download_by_key(s3_key)
+    if ruta is None:
+        for ext in (".zip",".pkl"):
+            p = op.join(MODELOS_DIR, f"{modelo_id}{ext}")
+            if op.exists(p): ruta = p; break
+        if ruta is None: ruta = _s3_try_download_guess(modelo_id)
+    if ruta is None: return None
+
+    if ruta.endswith(".zip"):
+        try:
+            import stable_baselines3 as sb3
+            for cls in ("DQN","PPO","A2C","SAC","TD3"):
+                if hasattr(sb3, cls):
+                    try:
+                        algo = getattr(sb3, cls).load(ruta)
+                        w = _SB3Wrapper(algo)
+                        _modelos_cache[modelo_id] = w
+                        logging.info(f"✅ Cargado SB3 ({cls}) desde {ruta}")
+                        return w
+                    except Exception: pass
+            raise RuntimeError("No se pudo cargar el .zip con SB3.")
+        except Exception as e:
+            logging.exception(f"Error SB3: {e}")
+            return None
+
+    if ruta.endswith(".pkl"):
+        import cloudpickle as pickle
+        with open(ruta, "rb") as f:
+            obj = pickle.load(f)
+        # si ya trae predict/act, o auto-adaptamos a tabular
+        w = _CustomWrapper(obj)
+        _modelos_cache[modelo_id] = w
+        logging.info(f"✅ Cargado custom .pkl desde {ruta}")
+        return w
+    return None
+
+# --------------------------- Simulación ---------------------------
+def _actualizar_estado(**kw):
+    with estado_lock: estado.update(kw)
+
+def _reset_estado():
+    _actualizar_estado(en_ejecucion=False, modo=None, modelo_id=None, recompensa=0.0, pasos=0)
+
+def _simular(modo: str, modelo_id: Optional[str]=None, seed: Optional[int]=None, fps: float=60.0):
+    global ultimo_jpeg
+    env=None
+    try:
+        env = gym.make("LunarLander-v2", render_mode="rgb_array")
+        obs,_ = env.reset(seed=seed)
+        terminado = truncado = False
+        modelo=None
+        if modo=="modelo":
+            modelo = _cargar_modelo(modelo_id) if modelo_id else None
+            if modelo is None:
+                logging.warning("Modelo no disponible; abortando episodio.")
+                return
+        _actualizar_estado(en_ejecucion=True, modo=modo, modelo_id=modelo_id, recompensa=0.0, pasos=0)
+        frame = env.render()
+        with frame_lock: ultimo_jpeg = _to_jpeg(frame)
+        dt = 1.0/max(fps,1.0)
+        while not (terminado or truncado) and not stop_event.is_set():
+            if modo=="humano":
+                with control_lock: accion = _accion_desde_teclas(control["keys"])
+            elif modelo is None:
+                accion = _politica_demo(obs)
+            else:
+                accion = modelo.predict(obs)
+            obs, r, terminado, truncado, _ = env.step(accion)
+            frame = env.render()
+            with frame_lock: ultimo_jpeg = _to_jpeg(frame)
+            with estado_lock: estado["recompensa"] += float(r); estado["pasos"] += 1
+            time.sleep(dt)
+    except Exception as e:
+        logging.exception(f"Error simulación: {e}")
+    finally:
+        if env is not None: env.close()
+        with estado_lock: estado["ultimo_puntaje"] = estado["recompensa"]
+        stop_event.clear()
+        with control_lock: control["enabled"]=False
+        _reset_estado()
+
+def _generador_mjpeg():
+    boundary = b"--frame"
+    while True:
+        with frame_lock: jpg = ultimo_jpeg
+        if jpg is None:
+            time.sleep(0.02); continue
+        yield boundary+b"\r\n"
+        yield b"Content-Type: image/jpeg\r\n"
+        yield f"Content-Length: {len(jpg)}\r\n\r\n".encode("ascii")
+        yield jpg + b"\r\n"
+        time.sleep(0.02)
+
+# --------------------------- Rutas REST ---------------------------
+@app.route("/")
+def index():
+    return render_template("index.html", esperados=MODELOS_ESPERADOS)
+
+@app.get("/estado")
+def get_estado():
+    with estado_lock: return jsonify(estado)
+
+@app.get("/stream")
+def stream():
+    return Response(_generador_mjpeg(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.post("/demo")
+def post_demo():
+    global hilo_simulacion
+    if estado["en_ejecucion"]: return jsonify({"ok": False, "msg": "Ya hay un episodio en ejecución"}), 409
+    stop_event.clear()
+    hilo_simulacion = threading.Thread(target=_simular, kwargs={"modo":"demo","seed":int(np.random.randint(0,10000))}, daemon=True)
+    hilo_simulacion.start()
+    return jsonify({"ok": True})
+
+@app.post("/modelo")
+def post_modelo():
+    global hilo_simulacion
+    data = request.get_json(silent=True) or {}
+    modelo_id = data.get("modelo_id")
+    s3_key    = data.get("s3_key") or MODELOS_MAP.get(modelo_id)
+    if estado["en_ejecucion"]: return jsonify({"ok": False, "msg": "Ya hay un episodio en ejecución"}), 409
+    if s3_key and S3_BUCKET:
+        p = _s3_try_download_by_key(s3_key)
+        if not p: return jsonify({"ok": False, "msg": f"No se pudo descargar {s3_key}"}), 400
+        modelo_id = op.splitext(op.basename(s3_key))[0]
+    if not modelo_id: return jsonify({"ok": False, "msg": "Falta 'modelo_id'"}), 400
+    ok=False
+    for ext in (".zip",".pkl"):
+        if os.path.exists(os.path.join(MODELOS_DIR, f"{modelo_id}{ext}")): ok=True; break
+    if not ok:
+        if not _s3_try_download_guess(modelo_id):
+            return jsonify({"ok": False, "msg": f"No se encontró {modelo_id} (.zip/.pkl) local ni en S3"}), 404
+    stop_event.clear()
+    hilo_simulacion = threading.Thread(target=_simular, kwargs={"modo":"modelo","modelo_id":modelo_id,"seed":int(np.random.randint(0,10000))}, daemon=True)
+    hilo_simulacion.start()
+    return jsonify({"ok": True})
+
+@app.post("/stop")
+def post_stop():
+    if not estado["en_ejecucion"]: return jsonify({"ok": True, "msg": "No había episodio en curso"})
+    stop_event.set(); return jsonify({"ok": True})
+
+@app.post("/humano/start")
+def humano_start():
+    global hilo_simulacion
+    if estado["en_ejecucion"]: return jsonify({"ok": False, "msg": "Ya hay un episodio en ejecución"}), 409
+    with control_lock: control["enabled"]=True; control["keys"]={"up":False,"left":False,"right":False}
+    stop_event.clear()
+    hilo_simulacion = threading.Thread(target=_simular, kwargs={"modo":"humano","seed":int(np.random.randint(0,10000))}, daemon=True)
+    hilo_simulacion.start()
+    return jsonify({"ok": True})
+
+@app.post("/humano/keys")
+def humano_keys():
+    data = request.get_json(silent=True) or {}
+    with control_lock:
+        for k in ("up","left","right"):
+            if k in data: control["keys"][k]=bool(data[k])
+    return jsonify({"ok": True, "keys": control["keys"]})
+
+@app.post("/humano/stop")
+def humano_stop():
+    stop_event.set(); return jsonify({"ok": True})
+
+@app.post("/models/refresh")
+def models_refresh():
+    if not S3_BUCKET: return jsonify({"ok": False, "msg": "S3 no configurado"}), 400
+    bajados=[]
+    for label, key in MODELOS_MAP.items():
+        base = os.path.basename(key)
+        if not os.path.exists(os.path.join(MODELOS_DIR, base)):
+            p = _s3_try_download_by_key(key)
+            if p: bajados.append(base)
+    return jsonify({"ok": True, "descargados": bajados})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    host = os.environ.get("HOST", "0.0.0.0")
+    logging.info(f"Sirviendo en http://{host}:{port}  (REST + MJPEG + humano + S3, modelos: {', '.join(MODELOS_ESPERADOS)})")
+    app.run(host=host, port=port, debug=False, threaded=True)

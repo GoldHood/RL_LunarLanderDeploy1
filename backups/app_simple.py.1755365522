@@ -1,0 +1,148 @@
+import os
+import pickle
+import cloudpickle as cp
+import numpy as np
+import gymnasium as gym
+from gymnasium.wrappers import RecordVideo
+from flask import Flask, render_template, send_file, abort
+
+# ============== TileCoder idéntico al del notebook (get_active_tiles) ==============
+class TileCoder:
+    def __init__(self, num_tilings, tiles_per_dim, state_bounds):
+        self.num_tilings   = int(num_tilings)
+        self.tiles_per_dim = np.array(tiles_per_dim, dtype=int)
+        self.state_bounds  = np.array(state_bounds, dtype=float)
+        # ancho de tesela por dimensión
+        self.tile_widths   = (self.state_bounds[:,1] - self.state_bounds[:,0]) / (self.tiles_per_dim - 1)
+        # offsets (tilings desplazados)
+        self.offsets       = (np.arange(self.num_tilings) * -1.0/self.num_tilings)[...,None] * self.tile_widths
+        self._mults        = np.array([np.prod(self.tiles_per_dim[:d]) for d in range(len(self.tiles_per_dim))], dtype=int)
+
+    def get_active_tiles(self, state):
+        st = np.clip(np.asarray(state, dtype=np.float32), self.state_bounds[:,0], self.state_bounds[:,1])
+        scaled = (st - self.state_bounds[:,0]) / self.tile_widths
+        active = []
+        base_stride = int(np.prod(self.tiles_per_dim))
+        for i in range(self.num_tilings):
+            base = i * base_stride
+            coords = np.floor(scaled + self.offsets[i]).astype(int)
+            idx = base + int(np.sum(coords * self._mults))
+            active.append(idx)
+        return active
+
+# ============== Construye una policy(obs)->action compatible con todos los casos ==============
+def load_policy(model_path):
+    # 1) cargar con cloudpickle y si falla, pickle estándar
+    with open(model_path, "rb") as f:
+        try:
+            obj = cp.load(f)
+        except Exception:
+            f.seek(0)
+            obj = pickle.load(f)
+
+    # 2) Si es directamente una función (policy), úsala
+    if callable(obj):
+        def policy(obs):
+            a = obj(np.asarray(obs, dtype=np.float32))
+            return int(a)
+        return policy, "callable"
+
+    # 3) Si es diccionario de Q-Learning con Tile Coding (como en tu notebook)
+    if isinstance(obj, dict) and (("q_weights" in obj) or ("Q_weights" in obj)) and ("tile_coder" in obj):
+        weights = obj.get("q_weights") or obj.get("Q_weights")
+        tc_cfg  = obj["tile_coder"]
+
+        # reconstruir TileCoder (viene como dict de parámetros)
+        if isinstance(tc_cfg, dict) and {"num_tilings","tiles_per_dim","state_bounds"}.issubset(tc_cfg.keys()):
+            tc = TileCoder(
+                num_tilings   = tc_cfg["num_tilings"],
+                tiles_per_dim = np.array(tc_cfg["tiles_per_dim"], dtype=int),
+                state_bounds  = np.array(tc_cfg["state_bounds"], dtype=float),
+            )
+            # si guardaste offsets, restáuralos
+            if "offsets" in tc_cfg:
+                tc.offsets = np.array(tc_cfg["offsets"], dtype=float)
+
+        # asegurar que las llaves de weights sean tuplas (tile, action)
+        fixed_w = {}
+        for k, v in (weights.items() if hasattr(weights, "items") else []):
+            if isinstance(k, tuple):
+                tile, a = int(k[0]), int(k[1])
+            else:
+                # algunas serializaciones guardan "(tile, a)" como string
+                try:
+                    tile, a = eval(k)
+                    tile, a = int(tile), int(a)
+                except Exception:
+                    continue
+            fixed_w[(tile, a)] = float(v)
+
+        # policy = argmax_a sum_{tiles activos} w[(tile, a)]
+        def policy(obs, _tc=tc, _w=fixed_w):
+            active = _tc.get_active_tiles(obs)
+            # LunarLander-v3 → 4 acciones
+            q = [0.0, 0.0, 0.0, 0.0]
+            for a in range(4):
+                s = 0.0
+                for t in active:
+                    s += _w.get((t, a), 0.0)
+                q[a] = s
+            return int(np.argmax(q))
+
+        return policy, "tile_q_dict"
+
+    # 4) Si es objeto con método conocido
+    for name in ("choose_action", "act", "predict"):
+        if hasattr(obj, name):
+            def policy(obs, _obj=obj, _name=name):
+                return int(getattr(_obj, _name)(np.asarray(obs, dtype=np.float32)))
+            return policy, f"method:{name}"
+
+    # 5) nada reconocido
+    raise RuntimeError("Formato de modelo no reconocido: no es función, ni dict {q_weights,tile_coder}, ni clase con choose_action/act/predict")
+
+# ============== Flask app ==============
+app = Flask(__name__, template_folder="templates")
+
+MODELS_DIR = "models"
+VIDEO_DIR  = "videos"
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(VIDEO_DIR,  exist_ok=True)
+
+def run_episode(env_id, model_path, video_folder):
+    print(f"[INFO] Cargando modelo: {model_path}")
+    policy, kind = load_policy(model_path)
+    print(f"[INFO] Tipo detectado → {kind}")
+
+    env = gym.make(env_id, render_mode="rgb_array")
+    env = RecordVideo(env, video_folder=video_folder, episode_trigger=lambda x: True)
+
+    obs, _ = env.reset()
+    done, truncated = False, False
+    while not (done or truncated):
+        action = policy(obs)
+        obs, reward, done, truncated, _ = env.step(action)
+    env.close()
+
+@app.route("/")
+def index():
+    return render_template("index_simple.html")
+
+from flask import request
+@app.route("/run/<model_name>")
+def run_model(model_name):
+    model_path = os.path.join(MODELS_DIR, model_name)
+    if not os.path.exists(model_path):
+        abort(404, f"Modelo no encontrado: {model_name}")
+
+    run_episode("LunarLander-v3", model_path, VIDEO_DIR)
+
+    # devolver el último mp4
+    mp4s = [f for f in os.listdir(VIDEO_DIR) if f.endswith(".mp4")]
+    if not mp4s:
+        abort(500, "No se generó ningún .mp4")
+    latest = max(mp4s, key=lambda fn: os.path.getmtime(os.path.join(VIDEO_DIR, fn)))
+    return send_file(os.path.join(VIDEO_DIR, latest), mimetype="video/mp4")
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)

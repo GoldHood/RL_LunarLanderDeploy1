@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Lunar Lander Demo</title>
+  <style>
+    body { font-family: sans-serif; max-width: 900px; margin: 24px auto; }
+    button { margin-right: 8px; padding: 6px 10px; }
+  </style>
+</head>
+<body>
+  <h1>Prueba de Modelos RL - LunarLander</h1>
+
+  <!-- Usamos los .orig (diccionario con tile_coder + q_weights) -->
+  <button onclick="runModel('trained_agent_Qlearning1k.pkl.orig')">Q-Learning 1k (orig)</button>
+  <button onclick="runModel('trained_agent_Qlearning19k.pkl.orig')">Q-Learning 19k (orig)</button>
+  <!-- Dejamos SARSA para después si solo está en formato función -->
+  <!-- <button onclick="runModel('trained_agent_sarsa19k.pkl')">SARSA 19k</button> -->
+
+  <h2>Video:</h2>
+  <video id="landerVideo" width="720" controls></video>
+
+  <script>
+    async function runModel(modelName) {
+      const video = document.getElementById("landerVideo");
+      video.src = `/run/${modelName}?t=${Date.now()}`;
+      video.load();
+      video.play();
+    }
+  </script>
+</body>
+</html>
+

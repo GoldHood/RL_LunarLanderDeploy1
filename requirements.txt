@@ -1,0 +1,6 @@
+flask
+gymnasium[box2d]
+pygame
+moviepy
+cloudpickle
+numpy

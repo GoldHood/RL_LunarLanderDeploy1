@@ -1,0 +1,257 @@
+import os, io, time, threading, json, pickle, urllib.request, uuid
+from io import BytesIO
+from PIL import Image
+import numpy as np
+from flask import Flask, Response, jsonify, render_template, request, send_from_directory, abort
+import gymnasium as gym
+from gymnasium.wrappers.record_video import RecordVideo
+
+# ----------------------------
+# Config
+# ----------------------------
+ENV_ID = "LunarLander-v2"        # ¡importante! v2 con gymnasium 0.29.x
+HOST    = os.getenv("HOST", "0.0.0.0")
+PORT    = int(os.getenv("PORT", "8000"))
+
+MODELS_DIR = os.getenv("MODELS_DIR", "/app/models")
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+VIDEOS_DIR = "/app/videos"
+os.makedirs(VIDEOS_DIR, exist_ok=True)
+
+# Mapas de nombre -> archivo (local) o clave S3 pública
+S3_BUCKET = os.getenv("S3_BUCKET", "lunarlander")
+S3_PUBLIC = f"https://{S3_BUCKET}.s3.amazonaws.com"
+
+MODELOS_S3 = {
+    "Qlearning1k":  "trained_agent_Qlearning1k.pkl",
+    "Qlearning19k": "trained_agent_Qlearning19k.pkl",
+    "Sarsa19k":     "trained_agent_sarsa19k.pkl",
+}
+
+# ----------------------------
+# Estado global de simulación
+# ----------------------------
+app = Flask(__name__, template_folder="templates")
+lock = threading.Lock()
+
+ultimo_frame = None
+en_ejecucion = False
+hilo = None
+debe_detener = False
+recompensa_total = 0.0
+
+# Teclas humano (LEFT=A/← -> 1, MAIN=W/↑ -> 2, RIGHT=D/→ -> 3)
+teclas = {"left": False, "main": False, "right": False}
+
+# ----------------------------
+# Utilidades
+# ----------------------------
+def jpg_bytes_from_rgb(rgb):
+    im = Image.fromarray(rgb)
+    bio = BytesIO()
+    im.save(bio, format="JPEG", quality=80)
+    return bio.getvalue()
+
+def descarga_publica_s3(key, destino):
+    url = f"{S3_PUBLIC}/{key}"
+    urllib.request.urlretrieve(url, destino)
+
+class ModeloWrapper:
+    """Soporta .pkl clásicos (Qlearning/SARSA) y, si algún día usas .zip SB3, lo intenta."""
+    def __init__(self, obj):
+        self.obj = obj
+
+    def act(self, obs):
+        # Obs como np.array 1D
+        if hasattr(self.obj, "predict"):
+            a, _ = self.obj.predict(obs[None, :], deterministic=True)
+            return int(a)
+        if hasattr(self.obj, "act"):
+            return int(self.obj.act(obs))
+        if hasattr(self.obj, "choose_action"):
+            return int(self.obj.choose_action(obs))
+        raise RuntimeError("El objeto .pkl no expone predict/act/choose_action.")
+
+def cargar_modelo(nombre):
+    # 1) Si existe local .pkl -> usar
+    local_pkl = os.path.join(MODELS_DIR, f"{nombre}.pkl")
+    if os.path.exists(local_pkl):
+        with open(local_pkl, "rb") as f:
+            return ModeloWrapper(pickle.load(f))
+
+    # 2) Si existe mapeo S3 -> descargar público
+    if nombre in MODELOS_S3:
+        key = MODELOS_S3[nombre]
+        os.makedirs(MODELS_DIR, exist_ok=True)
+        destino = os.path.join(MODELS_DIR, f"{nombre}.pkl")
+        descarga_publica_s3(key, destino)
+        with open(destino, "rb") as f:
+            return ModeloWrapper(pickle.load(f))
+
+    # 3) Si algún día hay .zip, aquí podrías intentar SB3 (omitido por ahora)
+    raise FileNotFoundError(f"No encontré modelo '{nombre}' local ni en S3.")
+
+def accion_humano():
+    # Prioridad: MAIN > LEFT > RIGHT > NOOP
+    if teclas["main"]:
+        return 2
+    if teclas["left"]:
+        return 1
+    if teclas["right"]:
+        return 3
+    return 0
+
+def _simular_loop(politica_callable, seed):
+    global ultimo_frame, en_ejecucion, debe_detener, recompensa_total
+    env = None
+    try:
+        env = gym.make(ENV_ID, render_mode="rgb_array")
+        obs, _ = env.reset(seed=seed)
+        terminado = False
+        truncado = False
+        recompensa_total = 0.0
+
+        while not (terminado or truncado) and not debe_detener:
+            a = int(politica_callable(obs))
+            obs, r, terminado, truncado, _ = env.step(a)
+            recompensa_total += float(r)
+            # frame
+            frame = env.render()
+            with lock:
+                ultimo_frame = jpg_bytes_from_rgb(frame)
+        # último frame también
+        frame = env.render()
+        with lock:
+            ultimo_frame = jpg_bytes_from_rgb(frame)
+    finally:
+        if env is not None:
+            env.close()
+        en_ejecucion = False
+
+def iniciar_simulacion(politica_callable, seed):
+    global en_ejecucion, debe_detener, hilo
+    detener()
+    en_ejecucion = True
+    debe_detener = False
+    hilo = threading.Thread(target=_simular_loop, args=(politica_callable, seed), daemon=True)
+    hilo.start()
+
+def detener():
+    global en_ejecucion, debe_detener, hilo
+    debe_detener = True
+    if hilo and hilo.is_alive():
+        hilo.join(timeout=1.0)
+    en_ejecucion = False
+
+# ----------------------------
+# Rutas HTTP
+# ----------------------------
+@app.get("/")
+def home():
+    return render_template("index.html")
+
+@app.get("/estado")
+def estado():
+    return jsonify({
+        "ok": True,
+        "en_ejecucion": en_ejecucion,
+        "recompensa": round(recompensa_total, 2)
+    })
+
+@app.get("/stream")
+def stream():
+    boundary = "frame"
+    def gen():
+        while True:
+            with lock:
+                data = ultimo_frame
+            if data is not None:
+                yield (b"--" + boundary.encode() + b"\r\n"
+                       b"Content-Type: image/jpeg\r\n"
+                       b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" +
+                       data + b"\r\n")
+            time.sleep(1/30)  # ~30 FPS
+    return Response(gen(), mimetype=f"multipart/x-mixed-replace; boundary={boundary}")
+
+# ----- Humano -----
+@app.post("/humano/start")
+def humano_start():
+    seed = int(time.time()) % 10000
+    iniciar_simulacion(lambda obs: accion_humano(), seed)
+    return jsonify({"ok": True, "msg": "Humano iniciado"})
+
+@app.post("/humano/keys")
+def humano_keys():
+    payload = request.get_json(force=True, silent=True) or {}
+    teclas["left"]  = bool(payload.get("left"))
+    teclas["main"]  = bool(payload.get("main"))
+    teclas["right"] = bool(payload.get("right"))
+    return jsonify({"ok": True})
+
+# ----- Modelos -----
+@app.post("/modelo")
+def modelo():
+    data = request.get_json(force=True, silent=True) or {}
+    nombre = data.get("nombre")
+    if not nombre:
+        return jsonify({"ok": False, "msg": "Falta 'nombre'"}), 400
+    try:
+        wrapper = cargar_modelo(nombre)
+        seed = int(time.time()) % 10000
+        iniciar_simulacion(lambda obs: wrapper.act(obs), seed)
+        return jsonify({"ok": True, "msg": f"Modelo {nombre} ejecutándose"})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": f"Error cargando/ejecutando: {e}"}), 500
+
+@app.post("/stop")
+def stop():
+    detener()
+    return jsonify({"ok": True})
+
+# ----- Video MP4 de un episodio -----
+@app.post("/modelo/video")
+def modelo_video():
+    data = request.get_json(force=True, silent=True) or {}
+    nombre = data.get("nombre")
+    if not nombre:
+        return jsonify({"ok": False, "msg": "Falta 'nombre'"}), 400
+    try:
+        wrapper = cargar_modelo(nombre)
+        fn = f"{nombre}_{uuid.uuid4().hex[:8]}"
+        carpeta = os.path.join(VIDEOS_DIR, nombre)
+        os.makedirs(carpeta, exist_ok=True)
+
+        env = gym.make(ENV_ID, render_mode="rgb_array")
+        env = RecordVideo(env, video_folder=carpeta,
+                          name_prefix=fn, episode_trigger=lambda ep: True)
+        obs, _ = env.reset(seed=int(time.time()) % 10000)
+        terminado = False
+        truncado = False
+        while not (terminado or truncado):
+            a = int(wrapper.act(obs))
+            obs, r, terminado, truncado, _ = env.step(a)
+        env.close()
+
+        # localizar mp4
+        mp4 = None
+        for f in sorted(os.listdir(carpeta)):
+            if f.startswith(fn) and f.endswith(".mp4"):
+                mp4 = f"/videos/{nombre}/{f}"
+        if not mp4:
+            raise RuntimeError("No se generó MP4")
+
+        return jsonify({"ok": True, "url": mp4})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": f"Error vídeo: {e}"}), 500
+
+@app.get("/videos/<path:subpath>")
+def serve_video(subpath):
+    p = os.path.join(VIDEOS_DIR, os.path.dirname(subpath))
+    file = os.path.basename(subpath)
+    if not os.path.exists(os.path.join(p, file)):
+        abort(404)
+    return send_from_directory(p, file, mimetype="video/mp4")
+
+if __name__ == "__main__":
+    app.run(host=HOST, port=PORT, debug=False)

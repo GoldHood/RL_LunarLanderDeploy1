@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>LunarLander — visor REST</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body{background:#0b1220;color:#eaeef7;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    .bar{display:flex;gap:.6rem;align-items:center;margin:1rem 0}
+    button{background:#1b3dd6;color:#fff;border:0;border-radius:8px;padding:.55rem .9rem;font-weight:600;cursor:pointer}
+    button.red{background:#d43c3c}
+    button.alt{background:#2c3e70}
+    #estado{background:#121a2c;border:1px solid #22315a;border-radius:10px;padding:.6rem .9rem}
+    .wrap{max-width:1100px;margin:0 auto}
+    img#stream{width:100%;max-width:760px;border-radius:12px;border:1px solid #22315a;background:#000;display:block}
+    .small{opacity:.8;font-size:.9rem;margin-top:.4rem}
+    video{max-width:760px;width:100%;margin-top:10px;border:1px solid #22315a;border-radius:10px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🛸 LunarLander — visor REST</h1>
+
+  <div class="bar">
+    <button id="btn-humano">Humano</button>
+    <button id="btn-demo" class="alt">Demo</button>
+    <button data-modelo="Qlearning1k">Qlearning1k</button>
+    <button data-modelo="Qlearning19k">Qlearning19k</button>
+    <button data-modelo="Sarsa19k">Sarsa19k</button>
+    <button id="btn-stop" class="red">Stop</button>
+    <button id="btn-video" class="alt" title="Grabar un episodio del modelo seleccionado">🎥 Video del modelo</button>
+  </div>
+
+  <div id="estado">Inactivo. Pulsa Humano, Demo o un modelo.</div>
+
+  <img id="stream" src="/stream" alt="stream" />
+
+  <div class="small">Modelos esperados: <em>Qlearning1k, Qlearning19k, Sarsa19k</em> (si existen .pkl en S3 o en <code>/app/models</code>).</div>
+
+  <video id="video" controls style="display:none"></video>
+</div>
+
+<script>
+const estado = document.getElementById('estado');
+const video  = document.getElementById('video');
+let modeloSeleccionado = null;
+
+async function post(url, body) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
+  return r.json();
+}
+
+async function refrescarEstado(){
+  try{
+    const r = await fetch('/estado'); const j = await r.json();
+    if(j.ok){
+      estado.textContent = (j.en_ejecucion? 'Ejecutando' : 'Inactivo') + ' | recompensa: ' + j.recompensa;
+    }
+  }catch(e){}
+}
+
+setInterval(refrescarEstado, 500);
+
+document.getElementById('btn-humano').onclick = async ()=>{
+  modeloSeleccionado = null;
+  await post('/humano/start', {});
+};
+
+document.getElementById('btn-demo').onclick = async ()=>{
+  modeloSeleccionado = 'DEMO';
+  // Demo: usamos el mismo endpoint de modelo llamando a la "política demo"
+  await post('/modelo', {nombre:'Qlearning1k'}); // si quieres, cámbialo a un modelo específico
+};
+
+document.querySelectorAll('button[data-modelo]').forEach(btn=>{
+  btn.onclick = async ()=>{
+    modeloSeleccionado = btn.getAttribute('data-modelo');
+    await post('/modelo', {nombre: modeloSeleccionado});
+  };
+});
+
+document.getElementById('btn-stop').onclick = async ()=>{
+  modeloSeleccionado = null;
+  await post('/stop', {});
+};
+
+document.getElementById('btn-video').onclick = async ()=>{
+  if(!modeloSeleccionado){ alert('Primero selecciona un modelo.'); return; }
+  estado.textContent = 'Grabando episodio...';
+  const j = await post('/modelo/video', {nombre: modeloSeleccionado});
+  if(j.ok){
+    video.style.display = 'block';
+    video.src = j.url + '?t=' + Date.now();
+    video.play();
+    estado.textContent = 'Video listo. Reproduce el clip.';
+  }else{
+    estado.textContent = 'Error vídeo: ' + (j.msg||'');
+  }
+};
+
+// Controles de teclado para humano
+const keys = {left:false, main:false, right:false};
+function enviar(){
+  fetch('/humano/keys', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(keys)}).catch(()=>{});
+}
+window.addEventListener('keydown', (e)=>{
+  if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') keys.left=true;
+  if(e.key==='ArrowUp'||e.key==='w'||e.key==='W') keys.main=true;
+  if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') keys.right=true;
+  enviar();
+});
+window.addEventListener('keyup', (e)=>{
+  if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') keys.left=false;
+  if(e.key==='ArrowUp'||e.key==='w'||e.key==='W') keys.main=false;
+  if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') keys.right=false;
+  enviar();
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+services:
+  lunarlander:
+    build: .
+    container_name: lunarlander
+    ports:
+      - "80:8000"                     # expone en http://IP_PUBLICA/
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      MODELS_DIR: "/app/models"
+      AUTO_PULL_S3: "1"
+      S3_BUCKET: "lunarlander"        # <-- tu bucket
+      # S3_PREFIX: ""                 # si usas carpeta dentro del bucket, pon el prefijo
+      MODELOS_MAP_JSON: |
+        {"Qlearning1k":"trained_agent_Qlearning1k.pkl",
+         "Qlearning19k":"trained_agent_Qlearning19k.pkl",
+         "Sarsa19k":"trained_agent_sarsa19k.pkl"}
+      # Si NO usas IAM Role y quieres claves explícitas (no recomendado), descomenta:
+      # AWS_ACCESS_KEY_ID: "TU_KEY"
+      # AWS_SECRET_ACCESS_KEY: "TU_SECRET"
+      # AWS_DEFAULT_REGION: "us-east-1"
+    volumes:
+      - ./models:/app/models:rw
+    restart: unless-stopped

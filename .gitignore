@@ -1,4 +1,4 @@
-# Python
+# Python / venv
 __pycache__/
 *.pyc
 .venv/
@@ -7,12 +7,9 @@ venv/
 # Jupyter
 .ipynb_checkpoints/
 
-# Salidas/artefactos
+# Salidas pesadas
 videos/
 runs/
 *.mp4
 *.gif
 *.log
-
-# Docker runtime
-*.pid
